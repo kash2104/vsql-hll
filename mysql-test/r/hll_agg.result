@@ -1,0 +1,93 @@
+INSTALL EXTENSION vsql_hll;
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE TABLE t_nums (n BIGINT);
+INSERT INTO t_nums
+WITH RECURSIVE seq (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 100000)
+SELECT n FROM seq;
+# hll_agg
+SELECT hll_cardinality(hll_agg(hll_hash_bigint(n))) FROM t_nums;
+hll_cardinality(hll_agg(hll_hash_bigint(n)))
+100018
+SELECT hll_cardinality(hll_agg(hll_hash_bigint(n))) BETWEEN 98000 AND 102000
+FROM t_nums;
+hll_cardinality(hll_agg(hll_hash_bigint(n))) BETWEEN 98000 AND 102000
+1
+SELECT hll_cardinality(hll_agg(hll_hash_bigint(n % 10))) FROM t_nums
+WHERE n <= 10000;
+hll_cardinality(hll_agg(hll_hash_bigint(n % 10)))
+10
+SELECT n % 3 AS bucket, hll_cardinality(hll_agg(hll_hash_bigint(n))),
+COUNT(DISTINCT n)
+FROM t_nums WHERE n <= 30 GROUP BY bucket ORDER BY bucket;
+bucket	hll_cardinality(hll_agg(hll_hash_bigint(n)))	COUNT(DISTINCT n)
+0	10	10
+1	10	10
+2	10	10
+# hll_agg with NULL input
+CREATE TABLE t_vals (grp INT, v BIGINT);
+INSERT INTO t_vals VALUES (1, 10), (1, NULL), (1, 20), (1, 10), (2, NULL), (2, NULL);
+SELECT grp, hll_cardinality(hll_agg(hll_hash_bigint(v))),
+hll_agg(hll_hash_bigint(v)) = hll_empty()
+FROM t_vals GROUP BY grp ORDER BY grp;
+grp	hll_cardinality(hll_agg(hll_hash_bigint(v)))	hll_agg(hll_hash_bigint(v)) = hll_empty()
+1	2	0
+2	0	1
+SELECT hll_agg(hll_hash_bigint(v)) FROM t_vals WHERE grp = 99;
+hll_agg(hll_hash_bigint(v))
+NULL
+SELECT hll_agg(hll_hash_bigint(v)) =
+hll_add(hll_add(hll_empty(), hll_hash_bigint(10)), hll_hash_bigint(20))
+FROM t_vals WHERE grp = 1;
+hll_agg(hll_hash_bigint(v)) =
+hll_add(hll_add(hll_empty(), hll_hash_bigint(10)), hll_hash_bigint(20))
+1
+# hll_union_agg over daily sketches
+CREATE TABLE t_events (day INT, user_id BIGINT);
+INSERT INTO t_events SELECT 1 + n % 7, n % 5000 FROM t_nums WHERE n <= 35000;
+INSERT INTO t_events SELECT 3, n FROM t_nums WHERE n BETWEEN 90000 AND 91000;
+CREATE TABLE t_daily (day INT PRIMARY KEY, users hll);
+INSERT INTO t_daily
+SELECT day, hll_agg(hll_hash_bigint(user_id)) FROM t_events GROUP BY day;
+SELECT day, hll_cardinality(users) FROM t_daily ORDER BY day;
+day	hll_cardinality(users)
+1	4965
+2	4965
+3	5954
+4	4965
+5	4965
+6	4965
+7	4965
+SELECT hll_cardinality(hll_union_agg(users)) FROM t_daily;
+hll_cardinality(hll_union_agg(users))
+5954
+SELECT hll_cardinality(hll_agg(hll_hash_bigint(user_id))) FROM t_events;
+hll_cardinality(hll_agg(hll_hash_bigint(user_id)))
+5954
+SELECT (SELECT hll_union_agg(users) FROM t_daily) =
+(SELECT hll_agg(hll_hash_bigint(user_id)) FROM t_events);
+(SELECT hll_union_agg(users) FROM t_daily) =
+(SELECT hll_agg(hll_hash_bigint(user_id)) FROM t_events)
+1
+SELECT hll_cardinality(hll_union_agg(users)) FROM t_daily WHERE day <= 3;
+hll_cardinality(hll_union_agg(users))
+5954
+# hll_union_agg with NULL and EMPTY input
+INSERT INTO t_daily VALUES (100, NULL), (101, hll_empty());
+SELECT hll_union_agg(users) =
+(SELECT hll_union_agg(users) FROM t_daily WHERE day <= 7)
+FROM t_daily;
+hll_union_agg(users) =
+(SELECT hll_union_agg(users) FROM t_daily WHERE day <= 7)
+1
+SELECT hll_union_agg(users) FROM t_daily WHERE day = 100;
+hll_union_agg(users)
+NULL
+SELECT hll_union_agg(users) FROM t_daily WHERE day = 999;
+hll_union_agg(users)
+NULL
+SELECT hll_union_agg(users) FROM t_daily WHERE day IN (100, 101);
+hll_union_agg(users)
+\x11ae7f
+DROP TABLE t_daily, t_events, t_vals, t_nums;
+SET SESSION cte_max_recursion_depth = DEFAULT;
+UNINSTALL EXTENSION vsql_hll;
