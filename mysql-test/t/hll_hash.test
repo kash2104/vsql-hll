@@ -1,0 +1,36 @@
+INSTALL EXTENSION vsql_hll;
+
+--echo # hll_hash_bigint
+SELECT hll_hash_bigint(0), hll_hash_bigint(100);
+SELECT hll_hash_bigint(-1), hll_hash_bigint(9223372036854775807);
+
+--echo # hll_hash_boolean
+SELECT hll_hash_boolean(FALSE), hll_hash_boolean(TRUE);
+SELECT hll_hash_boolean(5) = hll_hash_boolean(TRUE);
+
+--echo # hll_hash_text
+SELECT hll_hash_text('A'), hll_hash_text('AB'), hll_hash_text('');
+SELECT hll_hash_text('The quick brown fox jumps over the lazy dog');
+
+--echo # hll_hash_bytea_hex
+SELECT hll_hash_bytea_hex('4142'), hll_hash_bytea_hex('\\x4142'),
+       hll_hash_bytea_hex('\\X4142');
+SELECT hll_hash_bytea_hex('4a4B') = hll_hash_text('JK');
+SELECT hll_hash_bytea_hex(''), hll_hash_bytea_hex('\\x');
+SELECT hll_hash_bytea_hex('XYZ');
+SHOW WARNINGS;
+SELECT hll_hash_bytea_hex('414');
+SHOW WARNINGS;
+
+--echo # NULL input
+SELECT hll_hash_text(NULL), hll_hash_bigint(NULL),
+       hll_hash_bytea_hex(NULL), hll_hash_boolean(NULL);
+
+--echo # Table columns
+CREATE TABLE t_hash (id BIGINT, name VARCHAR(20), active BOOLEAN);
+INSERT INTO t_hash VALUES (1, 'alice', TRUE), (2, 'bob', FALSE), (3, NULL, NULL);
+SELECT id, hll_hash_bigint(id), hll_hash_text(name), hll_hash_boolean(active)
+FROM t_hash ORDER BY id;
+DROP TABLE t_hash;
+
+UNINSTALL EXTENSION vsql_hll;
