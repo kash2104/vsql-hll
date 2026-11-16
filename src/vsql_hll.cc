@@ -16,6 +16,7 @@
 
 #include <villagesql/vsql.h>
 
+#include <array>
 #include <cstring>
 #include <string>
 #include <string_view>
@@ -27,6 +28,7 @@ using vsql::CustomResult;
 using vsql::INT;
 using vsql::IntArg;
 using vsql::IntResult;
+using vsql::make_aggregate_func;
 using vsql::make_extension;
 using vsql::make_func;
 using vsql::make_type;
@@ -232,6 +234,67 @@ static void hll_cardinality_impl(CustomArg sketch, IntResult out) {
   }
 }
 
+struct SketchState {
+  bool has_input = false;
+  bool has_registers = false;
+  bool invalid = false;
+  std::array<unsigned char, kPayloadBytes> payload{};
+};
+
+static void sketch_state_clear(SketchState &state) {
+  state.has_input = false;
+  state.has_registers = false;
+  state.invalid = false;
+}
+
+static void sketch_state_result(const SketchState &state, CustomResult out) {
+  if (state.invalid) {
+    out.error(kInvalidSketch);
+    return;
+  }
+  if (!state.has_input) {
+    out.set_null();
+    return;
+  }
+  if (!state.has_registers) {
+    set_empty(out);
+    return;
+  }
+  unsigned char *registers = set_full(out);
+  if (registers == nullptr) return;
+  memcpy(registers, state.payload.data(), kPayloadBytes);
+}
+
+// A group of only NULL rows gives EMPTY, not NULL.
+static void hll_agg_accumulate(SketchState &state, IntArg hashed) {
+  state.has_input = true;
+  if (hashed.is_null()) return;
+  const uint64_t hash = static_cast<uint64_t>(hashed.value());
+  if (!hll::hash_sets_register(hash)) return;
+  if (!state.has_registers) {
+    state.payload.fill(0);
+    state.has_registers = true;
+  }
+  hll::add_hash(state.payload.data(), hash);
+}
+
+static void hll_union_agg_accumulate(SketchState &state, CustomArg sketch) {
+  if (sketch.is_null()) return;
+  const StoredView in = view(sketch);
+  if (in.kind == StoredKind::kInvalid) {
+    state.invalid = true;
+    return;
+  }
+  state.has_input = true;
+  if (in.kind != StoredKind::kFull) return;
+  if (state.has_registers) {
+    hll::union_payload(state.payload.data(), in.registers);
+  } else {
+    memcpy(state.payload.data(), in.registers, kPayloadBytes);
+    state.has_registers = true;
+  }
+}
+
 VEF_GENERATE_ENTRY_POINTS(
     make_extension()
         .type(HLL)
@@ -279,4 +342,21 @@ VEF_GENERATE_ENTRY_POINTS(
                   .returns(INT)
                   .param(HLL)
                   .deterministic()
+                  .build())
+        .func(make_aggregate_func<SketchState, &sketch_state_result>("hll_agg")
+                  .returns(HLL)
+                  .param(INT)
+                  .buffer_size(kFullBytes)
+                  .deterministic()
+                  .clear<&sketch_state_clear>()
+                  .accumulate<&hll_agg_accumulate>()
+                  .build())
+        .func(make_aggregate_func<SketchState, &sketch_state_result>(
+                  "hll_union_agg")
+                  .returns(HLL)
+                  .param(HLL)
+                  .buffer_size(kFullBytes)
+                  .deterministic()
+                  .clear<&sketch_state_clear>()
+                  .accumulate<&hll_union_agg_accumulate>()
                   .build()))
