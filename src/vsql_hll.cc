@@ -16,6 +16,7 @@
 
 #include <villagesql/vsql.h>
 
+#include <cstring>
 #include <string>
 #include <string_view>
 
@@ -33,7 +34,9 @@ using vsql::STRING;
 using vsql::StringArg;
 using vsql::StringResult;
 
+using hll::kEmptyBytes;
 using hll::kFullBytes;
+using hll::kPayloadBytes;
 using hll::StoredKind;
 using hll::StoredView;
 
@@ -50,6 +53,20 @@ static bool ensure_capacity(Result &out, size_t needed) {
   if (out.buffer().size() >= needed) return true;
   out.set_length(needed);
   return false;
+}
+
+static void set_empty(CustomResult &out) {
+  if (!ensure_capacity(out, kEmptyBytes)) return;
+  hll::write_header(out.buffer().data(), hll::kTypeEmpty);
+  out.set_length(kEmptyBytes);
+}
+
+static unsigned char *set_full(CustomResult &out) {
+  if (!ensure_capacity(out, kFullBytes)) return nullptr;
+  unsigned char *buf = out.buffer().data();
+  hll::write_header(buf, hll::kTypeFull);
+  out.set_length(kFullBytes);
+  return buf + hll::kHeaderBytes;
 }
 
 static void hll_from_string(std::string_view text, CustomResult out) {
@@ -145,9 +162,85 @@ static void hll_hash_boolean_impl(IntArg value, IntResult out) {
   out.set(hll::hash_boolean(value.value() != 0));
 }
 
+static void hll_empty_impl(CustomResult out) { set_empty(out); }
+
+static void hll_add_impl(CustomArg sketch, IntArg hashed, CustomResult out) {
+  if (sketch.is_null() || hashed.is_null()) {
+    out.set_null();
+    return;
+  }
+  const StoredView in = view(sketch);
+  if (in.kind == StoredKind::kInvalid) {
+    out.error(kInvalidSketch);
+    return;
+  }
+  const uint64_t hash = static_cast<uint64_t>(hashed.value());
+  if (in.kind == StoredKind::kEmpty && !hll::hash_sets_register(hash)) {
+    set_empty(out);
+    return;
+  }
+  unsigned char *registers = set_full(out);
+  if (registers == nullptr) return;
+  if (in.kind == StoredKind::kFull) {
+    memcpy(registers, in.registers, kPayloadBytes);
+  } else {
+    memset(registers, 0, kPayloadBytes);
+  }
+  hll::add_hash(registers, hash);
+}
+
+static void hll_union_impl(CustomArg a, CustomArg b, CustomResult out) {
+  if (a.is_null() || b.is_null()) {
+    out.set_null();
+    return;
+  }
+  const StoredView va = view(a);
+  const StoredView vb = view(b);
+  if (va.kind == StoredKind::kInvalid || vb.kind == StoredKind::kInvalid) {
+    out.error(kInvalidSketch);
+    return;
+  }
+  if (va.kind == StoredKind::kEmpty && vb.kind == StoredKind::kEmpty) {
+    set_empty(out);
+    return;
+  }
+  unsigned char *registers = set_full(out);
+  if (registers == nullptr) return;
+  memcpy(registers, va.kind == StoredKind::kFull ? va.registers : vb.registers,
+         kPayloadBytes);
+  if (va.kind == StoredKind::kFull && vb.kind == StoredKind::kFull) {
+    hll::union_payload(registers, vb.registers);
+  }
+}
+
+static void hll_cardinality_impl(CustomArg sketch, IntResult out) {
+  if (sketch.is_null()) {
+    out.set_null();
+    return;
+  }
+  const StoredView in = view(sketch);
+  switch (in.kind) {
+    case StoredKind::kEmpty:
+      out.set(0);
+      return;
+    case StoredKind::kFull:
+      out.set(hll::cardinality(in.registers));
+      return;
+    case StoredKind::kInvalid:
+      out.error(kInvalidSketch);
+      return;
+  }
+}
+
 VEF_GENERATE_ENTRY_POINTS(
     make_extension()
         .type(HLL)
+        .func(make_func<&hll_empty_impl>("hll_empty")
+                  .returns(HLL)
+                  .no_params()
+                  .buffer_size(kFullBytes)
+                  .deterministic()
+                  .build())
         .func(make_func<&hll_hash_text_impl>("hll_hash_text")
                   .returns(INT)
                   .param(STRING)
@@ -166,5 +259,24 @@ VEF_GENERATE_ENTRY_POINTS(
         .func(make_func<&hll_hash_boolean_impl>("hll_hash_boolean")
                   .returns(INT)
                   .param(INT)
+                  .deterministic()
+                  .build())
+        .func(make_func<&hll_add_impl>("hll_add")
+                  .returns(HLL)
+                  .param(HLL)
+                  .param(INT)
+                  .buffer_size(kFullBytes)
+                  .deterministic()
+                  .build())
+        .func(make_func<&hll_union_impl>("hll_union")
+                  .returns(HLL)
+                  .param(HLL)
+                  .param(HLL)
+                  .buffer_size(kFullBytes)
+                  .deterministic()
+                  .build())
+        .func(make_func<&hll_cardinality_impl>("hll_cardinality")
+                  .returns(INT)
+                  .param(HLL)
                   .deterministic()
                   .build()))
