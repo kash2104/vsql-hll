@@ -1,0 +1,80 @@
+INSTALL EXTENSION vsql_hll;
+
+--echo # hll_empty
+SELECT hll_empty();
+SELECT hll_cardinality(hll_empty());
+
+--echo # hll_add
+SELECT hll_cardinality(hll_add(hll_add(hll_empty(), hll_hash_text('a')),
+                               hll_hash_text('a')));
+SELECT hll_cardinality(hll_add(hll_add(hll_add(hll_empty(), hll_hash_text('a')),
+                                       hll_hash_text('b')),
+                               hll_hash_text('c')));
+SELECT hll_cardinality(hll_add(hll_empty(), 0)),
+       hll_add(hll_empty(), 0) = hll_empty();
+
+--echo # hll_union
+SELECT hll_cardinality(hll_union(
+         hll_add(hll_add(hll_empty(), hll_hash_text('a')), hll_hash_text('b')),
+         hll_add(hll_add(hll_empty(), hll_hash_text('b')), hll_hash_text('c'))));
+SELECT hll_union(hll_empty(), hll_empty());
+SELECT hll_union(hll_empty(), hll_add(hll_empty(), 42)) = hll_add(hll_empty(), 42),
+       hll_union(hll_add(hll_empty(), 42), hll_empty()) = hll_add(hll_empty(), 42);
+
+--echo # NULL arguments
+SELECT hll_add(NULL, 1), hll_add(hll_empty(), NULL),
+       hll_union(NULL, hll_empty()), hll_union(hll_empty(), NULL),
+       hll_cardinality(NULL);
+
+--echo # hll columns
+CREATE TABLE t_sketch (id INT PRIMARY KEY, s hll);
+INSERT INTO t_sketch VALUES (1, hll_empty());
+INSERT INTO t_sketch VALUES (2, hll_add(hll_add(hll_empty(), 1), 2));
+INSERT INTO t_sketch VALUES (3, NULL);
+SELECT id, hll_cardinality(s) FROM t_sketch ORDER BY id;
+SELECT s = hll_add(hll_add(hll_empty(), 1), 2) FROM t_sketch WHERE id = 2;
+UPDATE t_sketch SET s = hll_add(s, hll_hash_text('x')) WHERE id IN (1, 2);
+SELECT id, hll_cardinality(s) FROM t_sketch ORDER BY id;
+
+--echo # Text input
+INSERT INTO t_sketch VALUES (10, '\\x11ae7f');
+INSERT INTO t_sketch VALUES (11, '11ae7f');
+INSERT INTO t_sketch VALUES (12, '\\x11ae00');
+SELECT id, s, hll_cardinality(s) FROM t_sketch WHERE id >= 10 ORDER BY id;
+
+--echo # PostgreSQL EXPLICIT and SPARSE values
+INSERT INTO t_sketch VALUES (13, '\\x12ae7f28df63b7cc57c3cb');
+INSERT INTO t_sketch VALUES (14, '\\x13ae7f0f2c10');
+INSERT INTO t_sketch VALUES (15, '\\x12ae7f');
+INSERT INTO t_sketch VALUES (16, '\\x12ae7f28df63b7cc57c3cb73dedc673db8195b');
+INSERT INTO t_sketch VALUES (17, '\\x13ae7f');
+SELECT id, hll_cardinality(s), s = hll_add(hll_empty(), hll_hash_bigint(0))
+FROM t_sketch WHERE id BETWEEN 13 AND 17 ORDER BY id;
+SELECT id, s = hll_empty() FROM t_sketch WHERE id IN (15, 17) ORDER BY id;
+SELECT s = hll_add(hll_add(hll_empty(), hll_hash_bigint(0)), hll_hash_bigint(100))
+FROM t_sketch WHERE id = 16;
+
+--echo # Invalid text input
+--error ER_TRUNCATED_WRONG_VALUE_FOR_FIELD
+INSERT INTO t_sketch VALUES (20, 'not a sketch');
+--error ER_TRUNCATED_WRONG_VALUE_FOR_FIELD
+INSERT INTO t_sketch VALUES (21, '\\x11ae');
+--error ER_TRUNCATED_WRONG_VALUE_FOR_FIELD
+INSERT INTO t_sketch VALUES (22, '\\x21ae7f');
+--error ER_TRUNCATED_WRONG_VALUE_FOR_FIELD
+INSERT INTO t_sketch VALUES (23, '\\x118b7f');
+--error ER_TRUNCATED_WRONG_VALUE_FOR_FIELD
+INSERT INTO t_sketch VALUES (24, '\\x10ae7f');
+--error ER_TRUNCATED_WRONG_VALUE_FOR_FIELD
+INSERT INTO t_sketch VALUES (25, '\\x11ae7f00');
+--error ER_TRUNCATED_WRONG_VALUE_FOR_FIELD
+INSERT INTO t_sketch VALUES (26, '\\x12ae7f73dedc673db8195b28df63b7cc57c3cb');
+--error ER_TRUNCATED_WRONG_VALUE_FOR_FIELD
+INSERT INTO t_sketch VALUES (27, '\\x12ae7f0102');
+--error ER_TRUNCATED_WRONG_VALUE_FOR_FIELD
+INSERT INTO t_sketch VALUES (28, '\\x14ae7f00');
+SELECT COUNT(*) FROM t_sketch;
+
+DROP TABLE t_sketch;
+
+UNINSTALL EXTENSION vsql_hll;
