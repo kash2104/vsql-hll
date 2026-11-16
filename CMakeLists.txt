@@ -38,6 +38,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Extension name
 set(EXTENSION_NAME "vsql_hll")
 
+# variable_length_type() is only in the dev ABI headers.
+set(VSQL_USE_DEV_ABI ON)
+
 # Find VillageSQL SDK
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 find_package(VillageSQL REQUIRED)
