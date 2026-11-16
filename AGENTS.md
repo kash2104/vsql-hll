@@ -1,243 +1,171 @@
 # AGENTS.md
 
-This file provides guidance to AI coding assistants when working with code in this repository.
+Guidance for AI coding assistants working in the `vsql-hll` repository.
 
-**Note**: Also check `AGENTS.local.md` for additional local development instructions when present.
+**Note**: Also check `AGENTS.local.md` for machine-specific instructions when present.
 
-## Project Overview
+## What this extension is
 
-This is a template project for creating VillageSQL extensions. It provides the minimum required files and structure to build, package, and install custom extensions for VillageSQL (a MySQL-compatible database). The template includes a simple "Hello, World!" function as an example.
+`vsql-hll`, a VillageSQL extension that estimates how many
+different values a column holds, using HyperLogLog sketches.
 
-## Build System
+- Extension name (in SQL and `manifest.json`): `vsql_hll`
+- Repository name: `vsql-hll`
+- Column type added: `hll`
+- Version: only in `manifest.json`
 
-- **Build**: `cmake . && make` (or `mkdir build && cd build && cmake .. && make`)
-- **Create VEB package**: Automatically created during `make`
-- **Install extension**: `make install` (if VillageSQL_VEB_INSTALL_DIR is defined)
+## Files
 
-The build process:
-1. Uses CMake to find VillageSQL via `find_package(VillageSQL REQUIRED)`
-2. Compiles C++ source files into shared library `hello.so`
-3. Packages library with `manifest.json` into `vsql_extension_template.veb` archive using `VEF_CREATE_VEB()` macro
-4. VEB can be installed and loaded using `INSTALL EXTENSION` command
+| File | What it contains |
+|---|---|
+| `src/hll_sketch.h` | Sketch constants and the `hll` namespace API. No VillageSQL headers. |
+| `src/hll_sketch.cc` | The sketch logic: MurmurHash3 (`hash_bytes`, `hash_bigint`, `hash_boolean`, `hash_hex_text`), adding a hash (`add_hash`), merging (`union_payload`), the estimate (`cardinality`), and the saved format (`view_stored`, `write_header`, `encode_hex`, `import_text`). |
+| `src/vsql_hll.cc` | The SQL side: the `hll` type (`HLL`), one `*_impl` function per SQL function, the aggregate state (`SketchState`), and the `VEF_GENERATE_ENTRY_POINTS()` registration. |
+| `mysql-test/t/hll_hash.test` | Tests for the hash functions. |
+| `mysql-test/t/hll_sketch.test` | Tests for the `hll` type and the sketch functions. |
+| `mysql-test/t/hll_agg.test` | Tests for `hll_agg` and `hll_union_agg`. |
+| `mysql-test/r/*.result` | Recorded expected output. Generated, never edited by hand. |
+| `CMakeLists.txt` | Builds `vsql_hll.so` from the two `.cc` files and packs `vsql_hll.veb`. |
+| `build.sh` | Configure, build, and install in one step. |
+| `README.md`, `TESTING.md` | User documentation. Keep them in plain, simple English. |
 
-Set `VillageSQL_BUILD_DIR` to point to your VillageSQL build directory.
+Keep the split: sketch logic goes in `hll_sketch.*` (testable without a
+server); `vsql_hll.cc` only reads arguments, checks NULL and validity, and
+writes results.
 
-## Architecture
+## SQL functions
 
-**Core Components:**
-- `src/hello.cc` - VEF function implementation for the hello_world function
-- `manifest.json` - Extension metadata (name, version, description, author, license)
-- `CMakeLists.txt` - CMake build configuration
-- `cmake/FindVillageSQL.cmake` - CMake module for finding VillageSQL
-- `mysql-test/t/` - Test files directory (`.test` files using MTR framework)
-- `mysql-test/r/` - Expected test results directory (`.result` files)
+| Function | Returns | Notes |
+|---|---|---|
+| `hll_hash_bigint(BIGINT)` | BIGINT | hashes the 8 bytes, little-endian |
+| `hll_hash_text(STRING)` | BIGINT | hashes the raw bytes |
+| `hll_hash_boolean(INT)` | BIGINT | hashes one byte; any non-zero value is TRUE |
+| `hll_hash_bytea_hex(STRING)` | BIGINT | hex text, optional `\x`; bad hex gives NULL and a warning |
+| `hll_empty()` | `hll` | 3-byte empty sketch, `\x11ae7f` |
+| `hll_add(hll, BIGINT)` | `hll` | |
+| `hll_union(hll, hll)` | `hll` | maximum of each register |
+| `hll_cardinality(hll)` | BIGINT | estimate, rounded |
+| `hll_agg(BIGINT)` | `hll` | aggregate; skips NULL; only-NULL group gives an empty sketch |
+| `hll_union_agg(hll)` | `hll` | aggregate; skips NULL; only-NULL group gives NULL |
 
-**Available Functions:**
-- `hello_world()` - Returns the string "Hello, World!"
+All hashes use MurmurHash3 x64_128 with seed 0 and return the first 64-bit
+word as a signed BIGINT.
+Scalar functions return NULL if any argument is NULL. Every function is
+registered with `.deterministic()`.
 
-**Dependencies:**
-- Requires VillageSQL (Extension Framework headers)
-- Uses VillageSQL Extension Framework (VEF) API
-- C++ compiler with C++17 support
+## The sketch format
 
-**Code Organization:**
-- File naming: lowercase with underscores (e.g., `hello.cc`)
-- Function naming: lowercase with underscores (e.g., `hello_world`)
-- Extension naming: lowercase with underscores (e.g., `vsql_extension_template`)
-- Variable naming: lowercase with underscores (e.g., `result`)
+Fixed settings: log2m = 14 (16,384 registers), regwidth = 6 bits.
 
-## VillageSQL Extension Framework (VEF) API Pattern
+- Byte 0: `(schema version 1 << 4) | type`. Byte 1: `0xAE`. Byte 2: `0x7F`.
+- Stored values are always one of two forms:
+  - EMPTY: the 3-byte header only (`kEmptyBytes`).
+  - FULL: header plus 12,288 bytes of registers packed 6 bits each, high bit
+    first (`kFullBytes` = 12,291).
+- `import_text` also accepts the compact EXPLICIT and SPARSE text forms and
+  converts them to EMPTY or FULL. Because every stored value is in one of the
+  two stored forms, `hll_compare` can compare raw bytes.
+- The text form is `\x` plus lowercase hex, at most `hll::kMaxTextBytes`
+  (24,584) characters.
 
-Extensions use the typed C++ API: include `<villagesql/vsql.h>` and
-`using namespace vsql;`. Functions use typed wrappers (`IntArg`, `StringResult`,
-etc.). Do not mix protocols in the same extension.
+Do not change these bytes or the hash: that would break sketches users have
+already saved.
 
-Functions are registered using the `VEF_GENERATE_ENTRY_POINTS()` macro with a fluent builder interface.
+## VEF patterns used here
 
-### Basic Function Implementation
+Use the typed C++ API: `#include <villagesql/vsql.h>` with one
+`using vsql::...` line per name. Check names in the SDK headers, not from
+memory.
 
-Each function uses typed wrapper parameters:
-
-```cpp
-#include <villagesql/vsql.h>
-
-#include <cstring>
-
-using namespace vsql;
-
-// Integer result (no args)
-void my_function_impl(IntResult out) {
-    out.set(42);
-}
-
-// String result: write into buffer(), then call set_length()
-void my_string_impl(StringResult out) {
-    const char* value = "result";
-    auto buf = out.buffer();
-    memcpy(buf.data(), value, strlen(value));
-    out.set_length(strlen(value));
-}
-```
-
-### Function with Arguments
-
-Typed input wrappers (`IntArg`, `RealArg`, `StringArg`, `CustomArg`) provide
-`is_null()` and `value()`. List args before the result parameter:
+### The `hll` type
 
 ```cpp
-void my_function_impl(IntArg arg1, StringArg arg2, IntResult out) {
-    if (arg1.is_null() || arg2.is_null()) { out.set_null(); return; }
-    // arg1.value() -> int64_t
-    // arg2.value() -> std::string_view
-    out.set(arg1.value());
-}
+constexpr auto HLL = make_type<kHllTypeName>()
+                         .variable_length_type()
+                         .max_persisted_length(kFullBytes)
+                         .max_decode_buffer_length(hll::kMaxTextBytes)
+                         .from_string<&hll_from_string>()
+                         .to_string<&hll_to_string>()
+                         .compare<&hll_compare>()
+                         .intrinsic_default_str("\\x11ae7f")  // empty sketch
+                         .build();
 ```
 
-### Extension Registration
+- `variable_length_type()` exists only in the dev SDK headers, which is why
+  `CMakeLists.txt` sets `VSQL_USE_DEV_ABI ON`. Do not remove it.
+- `hll_from_string` is the only entry point with a `try`/`catch`, because it
+  builds `std::string` error messages.
 
-Use the `VEF_GENERATE_ENTRY_POINTS()` macro to register the extension and its functions:
+### Returning an `hll`
+
+- Every function or aggregate that returns `hll` must set
+  `.buffer_size(kFullBytes)`; the default buffer is too small for a FULL
+  sketch.
+- Write results with `set_empty(out)` or `set_full(out)` (which returns the
+  register area to fill). Both check the buffer size first.
+
+### Aggregates
+
+Both aggregates share `SketchState`, `sketch_state_clear`, and
+`sketch_state_result`, and differ only in their `accumulate` function:
 
 ```cpp
-VEF_GENERATE_ENTRY_POINTS(
-  make_extension()
-    .func(make_func<&my_function_impl>("my_function")
-      .returns(STRING)  // or INT, REAL, UUID, etc.
-      .param(STRING)    // Add .param() for each argument
-      .buffer_size(100) // For STRING return type
-      .build())
-)
+.func(make_aggregate_func<SketchState, &sketch_state_result>("hll_agg")
+          .returns(HLL).param(INT).buffer_size(kFullBytes).deterministic()
+          .clear<&sketch_state_clear>()
+          .accumulate<&hll_agg_accumulate>()
+          .build())
 ```
 
-### Result Types
+- `has_input` decides between NULL and an empty sketch: `hll_agg_accumulate`
+  sets it for every row, `hll_union_agg_accumulate` only for non-NULL
+  sketches.
+- `accumulate` cannot raise an error. An invalid sketch sets `state.invalid`,
+  and `sketch_state_result` raises the error for the whole group.
 
-Call the typed wrapper method on the result parameter:
+### Errors and warnings
 
-- `out.set(value)` / `out.set_length(n)` — returns a value (`VEF_RESULT_VALUE`)
-- `out.set_null()` — returns SQL NULL
-- `out.warning(msg)` — returns NULL with a SQL warning; call instead of `out.set()`, not in addition to it
-- `out.error(msg)` — aborts statement execution with an error
+- `out.error(msg)` fails the statement with `ER_VILLAGESQL_GENERIC_ERROR`
+  (3219). Invalid text inserted into an `hll` column fails the same way.
+- `out.warning(msg)` returns NULL with warning 3200. Only
+  `hll_hash_bytea_hex` uses it, for bad hex.
+- Invalid `hll` arguments raise `kInvalidSketch`
+  (`"argument is not a valid hll value"`).
 
-## Testing
+## Adding a SQL function
 
-The extension includes test files using the MySQL Test Runner (MTR) framework:
-- **Test Location**:
-  - `mysql-test/t/` directory contains `.test` files with SQL test commands
-  - `mysql-test/r/` directory contains `.result` files with expected output
-- **Run Tests**:
-  ```bash
-  cd <BUILD_DIR>/mysql-test
-  perl mysql-test-run.pl --suite=<path-to-vsql-extension-template>/mysql-test
-  ```
-  Where `<BUILD_DIR>` is your VillageSQL/MySQL build directory
-- **Create/Update Results**: Use `--record` flag to generate or update expected `.result` files:
-  ```bash
-  perl mysql-test-run.pl --suite=<path-to-test-dir> --record
-  ```
-- Tests should validate function output and behavior
-- Each test should install the extension, run tests, and clean up (drop functions, uninstall extension)
+1. If it needs new sketch logic, add it to `hll_sketch.h` / `hll_sketch.cc`
+   in the `hll` namespace.
+2. Add a `static void <name>_impl(...)` in `src/vsql_hll.cc`: arguments first,
+   result last; return NULL for NULL arguments; check `view(sketch).kind` for
+   `StoredKind::kInvalid`.
+3. Register it in `VEF_GENERATE_ENTRY_POINTS()` with `.deterministic()`, and
+   `.buffer_size(kFullBytes)` if it returns `hll`.
+4. Add checks to the matching `mysql-test/t/*.test` file and record the result.
+5. Update the function tables in `README.md` and in this file.
 
-## Extension Installation
+## Build and test
 
-After building the VEB file, load the extension in VillageSQL:
+```bash
+export VillageSQL_BUILD_DIR=/path/to/villagesql/build
+./build.sh                                   # builds and installs build/vsql_hll.veb
 
-```sql
-INSTALL EXTENSION vsql_extension_template;
+export VSQL_HLL_DIR="$(pwd)"
+cd "$VillageSQL_BUILD_DIR/mysql-test" && \
+perl mysql-test-run.pl --suite="$VSQL_HLL_DIR/mysql-test"            # run
+perl mysql-test-run.pl --suite="$VSQL_HLL_DIR/mysql-test" --record   # re-record
 ```
 
-Then test the functions:
-```sql
-SELECT hello_world();
-```
+- `mysql-test-run.pl` is in the VillageSQL build, not in this repository.
+- `--suite` needs an absolute path; use `$HOME` or a variable, never `~`
+  after `=`.
+- Expect extension errors in tests with `--error ER_VILLAGESQL_GENERIC_ERROR`.
+- After recording, review `git diff mysql-test/r/`; a changed hash or estimate
+  means saved sketches would no longer match.
 
-Note: Extension names use underscores, not hyphens (e.g., `vsql_extension_template`, not `vsql-extension-template`).
+## Conventions
 
-## Customizing the Template
-
-To create your own extension:
-
-1. **Update `manifest.json`**:
-   - Change `name` (use underscores, e.g., `my_extension_name`)
-   - Update `description`, `author`, and `version`
-
-2. **Update `CMakeLists.txt`**:
-   - Change `EXTENSION_NAME` variable (use underscores)
-   - Update library name in `add_library()` if desired
-   - Add additional source files to `add_library()` if needed
-   - Add dependencies (e.g., `find_package(OpenSSL)`, `target_link_libraries()`)
-
-3. **Implement your functions**:
-   - Modify `src/hello.cc` or create new `.cc` files
-   - Follow the VEF API pattern (single implementation function)
-   - Use `VEF_GENERATE_ENTRY_POINTS()` to register functions
-   - Add copyright header to all new source files
-
-4. **Register functions in code**:
-   - Functions are registered using the fluent builder API in `VEF_GENERATE_ENTRY_POINTS()`
-   - Specify return type with `.returns(STRING|INT|REAL|...)`
-   - Add parameters with `.param(type)`
-   - Set buffer size for STRING returns with `.buffer_size(N)`
-   - No separate `install.sql` file is needed
-
-5. **Create tests**:
-   - Add `.test` files in `mysql-test/t/` directory
-   - Generate expected results in `mysql-test/r/` using `--record` flag
-   - Each test should install extension, test functions, and clean up
-   - Verify function behavior with various inputs
-
-## Licensing and Copyright
-
-All source code files (`.cc`, `.h`, `.cpp`, `.hpp`) and CMake files (`CMakeLists.txt`) must include the following copyright header at the top of the file:
-
-```
-/* Copyright (c) 2026 VillageSQL Contributors
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version 2
- * of the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <https://www.gnu.org/licenses/>.
- */
-```
-
-When creating new source files, always include this copyright block before any code or includes.
-
-## Common Tasks for AI Agents
-
-When asked to add functionality to this template:
-
-1. **Adding a new function**:
-   - Create implementation function with typed wrappers: `void func_impl(IntArg a, StringResult out)` (args first, result last)
-   - Add function to `VEF_GENERATE_ENTRY_POINTS()` block using `.func(make_func<&func_impl>("name")...)`
-   - Specify return type, parameters, and buffer size
-   - Add to CMakeLists.txt if creating new source file
-   - Create tests
-
-2. **Modifying build**:
-   - Edit CMakeLists.txt, ensure proper library linking
-   - Use `target_link_libraries()` for dependencies
-
-3. **Adding dependencies**:
-   - Update CMakeLists.txt with `find_package()` or `target_link_libraries()`
-   - Example: OpenSSL requires `find_package(OpenSSL REQUIRED)` and `target_link_libraries(hello PRIVATE ${OPENSSL_LIBRARIES})`
-
-4. **Testing**:
-   - Create or update `.test` files in `mysql-test/t/` directory
-   - Generate expected results in `mysql-test/r/` using `--record`
-   - Use extension name with underscores in `INSTALL EXTENSION` commands
-
-5. **Documentation**:
-   - Update README.md to reflect new functionality
-
-**Important Conventions:**
-- Always use underscores in extension names (not hyphens)
-- Always include proper copyright headers in source files
-- Use C++17 standard
-- Functions are registered in code using VEF API (no install.sql needed)
-- Result: call `out.set(v)`, `out.set_null()`, `out.warning(msg)`, or `out.error(msg)`
+- C++17, lowercase_with_underscores, GPL v2 header on every .cc, .h and CMakeLists.txt.
+- The typed SDK API only: include <villagesql/vsql.h>. Never read or use anything under an abi/ directory.
+- Extension name uses underscores (vsql_hll); the repository uses a hyphen (vsql-hll).
+No PR or issue numbers in source or test files.
