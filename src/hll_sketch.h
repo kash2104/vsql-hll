@@ -25,6 +25,12 @@
 
 namespace hll {
 
+constexpr unsigned kLog2m = 14;
+constexpr unsigned kRegWidth = 6;
+constexpr uint32_t kNumRegisters = 1u << kLog2m;
+
+constexpr size_t kPayloadBytes = kNumRegisters * kRegWidth / 8;
+
 constexpr std::string_view kBadHexMessage =
     "input must be an even number of hex digits, optionally prefixed by \\x";
 
@@ -33,6 +39,12 @@ int64_t hash_bytes(const void *data, size_t len);
 int64_t hash_bigint(int64_t value);
 int64_t hash_boolean(bool value);
 bool hash_hex_text(std::string_view text, int64_t *out);
+
+bool hash_sets_register(uint64_t hash);
+void add_hash(unsigned char *payload, uint64_t hash);
+void union_payload(unsigned char *dst, const unsigned char *src);
+// Estimated distinct count, rounded and capped at the BIGINT maximum.
+int64_t cardinality(const unsigned char *payload);
 
 }  // namespace hll
 

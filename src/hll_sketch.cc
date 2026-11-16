@@ -16,9 +16,18 @@
 
 #include "hll_sketch.h"
 
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstring>
+#include <limits>
 
 namespace hll {
+
+constexpr uint8_t kMaxRegisterValue = (1u << kRegWidth) - 1;
+
+static_assert(kRegWidth == 6, "register packing assumes 6-bit registers");
+static_assert(kPayloadBytes % 3 == 0, "registers are packed 4 per 3 bytes");
 
 static uint64_t load_le64(const unsigned char *p) {
   uint64_t v = 0;
@@ -170,6 +179,97 @@ bool hash_hex_text(std::string_view text, int64_t *out) {
       &h);
   if (ok) *out = to_bigint(h);
   return ok;
+}
+
+static uint32_t load_group(const unsigned char *p) {
+  return (uint32_t{p[0]} << 16) | (uint32_t{p[1]} << 8) | p[2];
+}
+
+static void store_group(unsigned char *p, uint32_t g) {
+  p[0] = static_cast<unsigned char>(g >> 16);
+  p[1] = static_cast<unsigned char>(g >> 8);
+  p[2] = static_cast<unsigned char>(g);
+}
+
+static constexpr unsigned group_shift(unsigned k) { return 18 - 6 * k; }
+
+static void raise_register(unsigned char *payload, uint32_t i, uint8_t value) {
+  unsigned char *p = payload + (i >> 2) * 3;
+  const unsigned shift = group_shift(i & 3);
+  const uint32_t g = load_group(p);
+  if (value <= ((g >> shift) & kMaxRegisterValue)) return;
+  store_group(p, (g & ~(uint32_t{kMaxRegisterValue} << shift)) |
+                     (uint32_t{value} << shift));
+}
+
+bool hash_sets_register(uint64_t hash) { return (hash >> kLog2m) != 0; }
+
+void add_hash(unsigned char *payload, uint64_t hash) {
+  if (!hash_sets_register(hash)) return;
+  const uint32_t index = static_cast<uint32_t>(hash & (kNumRegisters - 1));
+  unsigned rank = static_cast<unsigned>(__builtin_ctzll(hash >> kLog2m)) + 1;
+  if (rank > kMaxRegisterValue) rank = kMaxRegisterValue;
+  raise_register(payload, index, static_cast<uint8_t>(rank));
+}
+
+void union_payload(unsigned char *dst, const unsigned char *src) {
+  for (size_t off = 0; off < kPayloadBytes; off += 3) {
+    const uint32_t s = load_group(src + off);
+    if (s == 0) continue;
+    const uint32_t d = load_group(dst + off);
+    uint32_t merged = 0;
+    for (unsigned k = 0; k < 4; ++k) {
+      const unsigned shift = group_shift(k);
+      merged |= std::max((d >> shift) & kMaxRegisterValue,
+                         (s >> shift) & kMaxRegisterValue)
+                << shift;
+    }
+    store_group(dst + off, merged);
+  }
+}
+
+static constexpr std::array<double, kMaxRegisterValue + 1> make_inv_pow2() {
+  std::array<double, kMaxRegisterValue + 1> table{};
+  double v = 1.0;
+  for (size_t r = 0; r < table.size(); ++r) {
+    table[r] = v;
+    v /= 2.0;
+  }
+  return table;
+}
+static constexpr auto kInvPow2 = make_inv_pow2();
+
+static double estimate(const unsigned char *payload) {
+  // Summed in register order, as postgresql-hll does, so results match.
+  double sum = 0.0;
+  uint32_t zeros = 0;
+  for (size_t off = 0; off < kPayloadBytes; off += 3) {
+    const uint32_t g = load_group(payload + off);
+    for (unsigned k = 0; k < 4; ++k) {
+      const uint32_t r = (g >> group_shift(k)) & kMaxRegisterValue;
+      sum += kInvPow2[r];
+      if (r == 0) ++zeros;
+    }
+  }
+  const double m = kNumRegisters;
+  const double alpha = 0.7213 / (1.0 + 1.079 / m);
+  const double e = alpha * m * m / sum;
+
+  if (zeros != 0 && e < 5.0 * m / 2.0) return m * std::log(m / zeros);
+
+  // postgresql-hll uses 2^76 here, which overflows its 64-bit shift; the
+  // hash space is 2^64.
+  const double two_to_l = std::ldexp(1.0, 64);
+  if (e <= two_to_l / 30.0) return e;
+  if (e >= two_to_l) return std::numeric_limits<double>::infinity();
+  return -two_to_l * std::log(1.0 - e / two_to_l);
+}
+
+int64_t cardinality(const unsigned char *payload) {
+  constexpr double kLimit = 9223372036854774784.0;  // largest double < 2^63
+  const double e = estimate(payload);
+  if (!(e < kLimit)) return std::numeric_limits<int64_t>::max();
+  return std::llround(e);
 }
 
 }  // namespace hll
