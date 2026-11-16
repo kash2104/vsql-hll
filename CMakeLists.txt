@@ -45,10 +45,10 @@ find_package(VillageSQL REQUIRED)
 message(STATUS "VillageSQL SDK found at: ${VillageSQL_PREFIX}")
 message(STATUS "VillageSQL include dir: ${VillageSQL_INCLUDE_DIR}")
 
-# Create the hello world shared library
+# Shared library holding the hll type, functions, and aggregates
 add_library(vsql_hll SHARED
-    src/hello.cc
     src/hll_sketch.cc
+    src/vsql_hll.cc
 )
 
 # Include directories
