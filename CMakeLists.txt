@@ -14,7 +14,7 @@
 # along with this program; if not, see <https://www.gnu.org/licenses/>.
 
 cmake_minimum_required(VERSION 3.18)
-project(vsql_extension_template)
+project(vsql_hll)
 
 # Default to an optimized build. An empty CMAKE_BUILD_TYPE yields -O0 (no
 # -O flag applied), which builds and runs but leaves the code unoptimized.
@@ -36,7 +36,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Extension name
-set(EXTENSION_NAME "vsql_extension_template")
+set(EXTENSION_NAME "vsql_hll")
 
 # Find VillageSQL SDK
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -46,18 +46,18 @@ message(STATUS "VillageSQL SDK found at: ${VillageSQL_PREFIX}")
 message(STATUS "VillageSQL include dir: ${VillageSQL_INCLUDE_DIR}")
 
 # Create the hello world shared library
-add_library(hello SHARED
+add_library(vsql_hll SHARED
     src/hello.cc
 )
 
 # Include directories
-target_include_directories(hello PRIVATE
+target_include_directories(vsql_hll PRIVATE
     ${VillageSQLExtensionFramework_INCLUDE_DIR}
 )
 
 # Create the VEB package
 VEF_CREATE_VEB(
     NAME ${EXTENSION_NAME}
-    LIBRARY_TARGET hello
+    LIBRARY_TARGET vsql_hll
     MANIFEST ${CMAKE_CURRENT_SOURCE_DIR}/manifest.json
 )
