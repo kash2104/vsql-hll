@@ -48,6 +48,7 @@ message(STATUS "VillageSQL include dir: ${VillageSQL_INCLUDE_DIR}")
 # Create the hello world shared library
 add_library(vsql_hll SHARED
     src/hello.cc
+    src/hll_sketch.cc
 )
 
 # Include directories
