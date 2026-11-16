@@ -25,13 +25,32 @@
 namespace hll {
 
 constexpr uint8_t kMaxRegisterValue = (1u << kRegWidth) - 1;
+constexpr size_t kMaxImportBytes = kHeaderBytes + 8 * 8192;
+constexpr uint8_t kSchemaVersion = 1;
+constexpr uint8_t kTypeUndefined = 0;
+constexpr uint8_t kTypeExplicit = 2;
+constexpr uint8_t kTypeSparse = 3;
+constexpr uint8_t kParamByte = ((kRegWidth - 1) << 5) | kLog2m;
+constexpr uint8_t kCutoffByte = (1u << 6) | 63;
+constexpr unsigned kSparseEntryBits = kLog2m + kRegWidth;
 
 static_assert(kRegWidth == 6, "register packing assumes 6-bit registers");
 static_assert(kPayloadBytes % 3 == 0, "registers are packed 4 per 3 bytes");
+static_assert(kSparseEntryBits == 20, "read_sparse_entry assumes 20 bits");
+
+static constexpr uint8_t type_byte(uint8_t type) {
+  return (kSchemaVersion << 4) | type;
+}
 
 static uint64_t load_le64(const unsigned char *p) {
   uint64_t v = 0;
   for (int i = 7; i >= 0; --i) v = (v << 8) | p[i];
+  return v;
+}
+
+static uint64_t load_be64(const unsigned char *p) {
+  uint64_t v = 0;
+  for (int i = 0; i < 8; ++i) v = (v << 8) | p[i];
   return v;
 }
 
@@ -141,6 +160,16 @@ static bool decode_hex_bytes(const char *hex, size_t n, unsigned char *out) {
   return true;
 }
 
+void encode_hex(const unsigned char *data, size_t len, char *out) {
+  static constexpr char kDigits[] = "0123456789abcdef";
+  *out++ = '\\';
+  *out++ = 'x';
+  for (size_t i = 0; i < len; ++i) {
+    *out++ = kDigits[data[i] >> 4];
+    *out++ = kDigits[data[i] & 0x0f];
+  }
+}
+
 int64_t hash_bytes(const void *data, size_t len) {
   const auto *bytes = static_cast<const unsigned char *>(data);
   uint64_t h = 0;
@@ -200,6 +229,11 @@ static void raise_register(unsigned char *payload, uint32_t i, uint8_t value) {
   if (value <= ((g >> shift) & kMaxRegisterValue)) return;
   store_group(p, (g & ~(uint32_t{kMaxRegisterValue} << shift)) |
                      (uint32_t{value} << shift));
+}
+
+static bool payload_is_zero(const unsigned char *payload) {
+  return std::all_of(payload, payload + kPayloadBytes,
+                     [](unsigned char b) { return b == 0; });
 }
 
 bool hash_sets_register(uint64_t hash) { return (hash >> kLog2m) != 0; }
@@ -270,6 +304,149 @@ int64_t cardinality(const unsigned char *payload) {
   const double e = estimate(payload);
   if (!(e < kLimit)) return std::numeric_limits<int64_t>::max();
   return std::llround(e);
+}
+
+StoredView view_stored(const unsigned char *data, size_t len) {
+  if (len >= kHeaderBytes && data[1] == kParamByte && data[2] == kCutoffByte) {
+    if (len == kEmptyBytes && data[0] == type_byte(kTypeEmpty)) {
+      return {StoredKind::kEmpty, nullptr};
+    }
+    if (len == kFullBytes && data[0] == type_byte(kTypeFull)) {
+      return {StoredKind::kFull, data + kHeaderBytes};
+    }
+  }
+  return {StoredKind::kInvalid, nullptr};
+}
+
+void write_header(unsigned char *out, uint8_t type) {
+  out[0] = type_byte(type);
+  out[1] = kParamByte;
+  out[2] = kCutoffByte;
+}
+
+static bool read_sparse_entry(const char *hex, size_t pos, uint32_t *entry) {
+  unsigned char window[3];
+  if (!decode_hex_bytes(hex + 2 * (pos >> 3), 3, window)) return false;
+  *entry = (load_group(window) >> (24 - kSparseEntryBits - (pos & 7))) &
+           ((1u << kSparseEntryBits) - 1);
+  return true;
+}
+
+size_t import_text(std::string_view text, unsigned char *out,
+                   std::string *error) {
+  const std::string_view hex = strip_hex_prefix(text);
+  if (hex.size() % 2 != 0) {
+    *error = kBadHexMessage;
+    return 0;
+  }
+  const size_t len = hex.size() / 2;
+  if (len < kHeaderBytes) {
+    *error = "hll value is shorter than its 3-byte header";
+    return 0;
+  }
+  if (len > kMaxImportBytes) {
+    *error = "hll value is too long";
+    return 0;
+  }
+  unsigned char header[kHeaderBytes];
+  if (!decode_hex_bytes(hex.data(), kHeaderBytes, header)) {
+    *error = kBadHexMessage;
+    return 0;
+  }
+  const unsigned version = header[0] >> 4;
+  const unsigned type = header[0] & 0x0f;
+  if (version != kSchemaVersion) {
+    *error = "unsupported hll schema version " + std::to_string(version);
+    return 0;
+  }
+  if (header[1] != kParamByte) {
+    *error = "hll value uses log2m=" + std::to_string(header[1] & 0x1f) +
+             " and regwidth=" + std::to_string((header[1] >> 5) + 1) +
+             "; vsql_hll requires log2m=14 and regwidth=6";
+    return 0;
+  }
+
+  const char *body = hex.data() + 2 * kHeaderBytes;
+  const size_t body_len = len - kHeaderBytes;
+  unsigned char *payload = out + kHeaderBytes;
+  memset(payload, 0, kPayloadBytes);
+
+  switch (type) {
+    case kTypeEmpty:
+      if (body_len != 0) {
+        *error = "EMPTY hll value must be exactly 3 bytes";
+        return 0;
+      }
+      break;
+
+    case kTypeExplicit: {
+      if (body_len % 8 != 0) {
+        *error = "EXPLICIT hll value must hold whole 8-byte elements";
+        return 0;
+      }
+      int64_t previous = 0;
+      for (size_t n = 0; n < body_len / 8; ++n) {
+        unsigned char element_bytes[8];
+        if (!decode_hex_bytes(body + 16 * n, 8, element_bytes)) {
+          *error = kBadHexMessage;
+          return 0;
+        }
+        const uint64_t element = load_be64(element_bytes);
+        const int64_t signed_element = to_bigint(element);
+        if (n > 0 && signed_element <= previous) {
+          *error = "EXPLICIT hll elements must be strictly ascending";
+          return 0;
+        }
+        previous = signed_element;
+        add_hash(payload, element);
+      }
+      break;
+    }
+
+    case kTypeSparse: {
+      const size_t total_bits = body_len * 8;
+      const size_t count = total_bits / kSparseEntryBits;
+      if (total_bits - count * kSparseEntryBits >= 8) {
+        *error = "SPARSE hll value has inconsistent padding";
+        return 0;
+      }
+      for (size_t n = 0; n < count; ++n) {
+        uint32_t entry = 0;
+        if (!read_sparse_entry(body, n * kSparseEntryBits, &entry)) {
+          *error = kBadHexMessage;
+          return 0;
+        }
+        raise_register(payload, entry >> kRegWidth,
+                       static_cast<uint8_t>(entry & kMaxRegisterValue));
+      }
+      break;
+    }
+
+    case kTypeFull:
+      if (body_len != kPayloadBytes) {
+        *error = "FULL hll value must be exactly " +
+                 std::to_string(kFullBytes) + " bytes";
+        return 0;
+      }
+      if (!decode_hex_bytes(body, kPayloadBytes, payload)) {
+        *error = kBadHexMessage;
+        return 0;
+      }
+      break;
+
+    default:
+      *error = type == kTypeUndefined
+                   ? "UNDEFINED hll values are not supported"
+                   : "unknown hll type " + std::to_string(type);
+      return 0;
+  }
+
+  if (payload_is_zero(payload)) {
+    write_header(out, kTypeEmpty);
+    return kEmptyBytes;
+  }
+  write_header(out, kTypeFull);
+  return kFullBytes;
 }
 
 }  // namespace hll
