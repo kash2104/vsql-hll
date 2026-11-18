@@ -266,7 +266,7 @@ See [TESTING.md](TESTING.md).
 ## Reporting bugs and asking for features
 
 Open an issue at
-[github.com/villagesql/villagesql-server/issues](https://github.com/villagesql/villagesql-server/issues).
+[github.com/kash2104/vsql-hll/issues](https://github.com/kash2104/vsql-hll/issues).
 Please include:
 
 - What you did (the SQL you ran)
