@@ -75,6 +75,9 @@ make sure every change is one you meant to make.
   written into the `.result` file automatically.
 - Drop every table that has an `hll` column before
   `UNINSTALL EXTENSION vsql_hll;`, otherwise the uninstall fails.
+- When a check allows some error in an estimate, remember that just above
+  40,000 different values the estimate can be up to about 3% too high (see
+  "How accurate is it?" in the README). Allow for that, or test other sizes.
 - Then record the expected output as shown above, and check it.
 
 ## If something goes wrong

@@ -71,6 +71,18 @@ Fixed settings: log2m = 14 (16,384 registers), regwidth = 6 bits.
 Do not change these bytes or the hash: that would break sketches users have
 already saved.
 
+### Accuracy
+
+`cardinality` uses linear counting while some registers are zero and the raw
+estimate is below 2.5 × 16,384 = 40,960, and the HyperLogLog formula above
+that. Typical error is about 1% (1.04 / √16384 ≈ 0.81%), but just above the
+switch the estimate runs high: about +3% at 40,000 distinct values, +1.4% at
+50,000, back under 1% by about 70,000 (measured with `hll_hash_bigint` over
+1..N). This is a known property of the estimator, not a bug; the README
+documents it under "How accurate is it?". Do not "fix" it by changing the
+estimator without a plan for sketches already saved, since estimates would
+change.
+
 ## VEF patterns used here
 
 Use the typed C++ API: `#include <villagesql/vsql.h>` with one
@@ -142,7 +154,6 @@ Both aggregates share `SketchState`, `sketch_state_clear`, and
 3. Register it in `VEF_GENERATE_ENTRY_POINTS()` with `.deterministic()`, and
    `.buffer_size(kFullBytes)` if it returns `hll`.
 4. Add checks to the matching `mysql-test/t/*.test` file and record the result.
-5. Update the function tables in `README.md` and in this file.
 
 ## Build and test
 
@@ -162,6 +173,33 @@ perl mysql-test-run.pl --suite="$VSQL_HLL_DIR/mysql-test" --record   # re-record
 - Expect extension errors in tests with `--error ER_VILLAGESQL_GENERIC_ERROR`.
 - After recording, review `git diff mysql-test/r/`; a changed hash or estimate
   means saved sketches would no longer match.
+
+## SDK and CI
+
+- The build needs the SDK's dev headers (`include-dev/`) because of
+  `variable_length_type()`.
+- `.github/workflows/ci.yml` builds and tests the extension on pull requests
+  (and manually) through `villagesql/extension-actions/cpp`. The VillageSQL
+  version it uses is set only there, in `villagesql-version`.
+
+## Known limitations
+
+- No index, `PRIMARY KEY`, or `UNIQUE` key on an `hll` column: ERROR 1071
+  (3,072-byte key limit; a FULL sketch is 12,291 bytes).
+- `hll_agg` / `hll_union_agg` cannot take `OVER (...)` or `DISTINCT`; the
+  server's parser rejects both after an extension aggregate.
+- Fixed precision (log2m 14, regwidth 6).
+- Estimates run up to about 3% high just above 40,000 distinct values (see
+  Accuracy).
+- An aggregate result coming out of a derived table or CTE cannot be passed
+  to another `hll` function ("argument 1 must be a custom type or string
+  constant"); stored columns are fine.
+- Built-in functions (`LENGTH`, `HEX`, `CONCAT`, `COALESCE`, `IF`,
+  `JSON_OBJECT`, `CAST`) reject `hll` values.
+- InnoDB only; `ENGINE=MEMORY` is refused.
+- `ORDER BY`, `<`, `>` compare raw bytes, so the order is meaningless.
+- `hll_add` / `hll_agg` accept any BIGINT and cannot tell a raw value from a
+  hash.
 
 ## Conventions
 
