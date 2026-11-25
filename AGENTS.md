@@ -185,8 +185,8 @@ perl mysql-test-run.pl --suite="$VSQL_HLL_DIR/mysql-test" --record   # re-record
 - `.github/workflows/ci.yml` builds and tests the extension on pull requests
   (and manually) through `villagesql/extension-actions/cpp`. The VillageSQL
   version it uses is set there, in `villagesql-version`. When you change it,
-  also update the "Supported VillageSQL version" section and the "You need"
-  list in `README.md`.
+  also update the VillageSQL version in the "Build and install" section of
+  `README.md`.
 
 ## Known limitations
 
