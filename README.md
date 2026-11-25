@@ -3,7 +3,8 @@
 `vsql_hll` is a VillageSQL extension that counts how many **different** values
 a column holds (for example, how many different users visited your site)
 quickly and with very little storage. The answer is an estimate, but a close
-one: on average it is off by less than 1%.
+one: usually within about 1% of the real count (see
+[How accurate is it?](#how-accurate-is-it)).
 
 ```sql
 INSTALL EXTENSION vsql_hll;
@@ -68,9 +69,18 @@ makes the result a count of *different* values.
 
 You need:
 
-- A VillageSQL server build, or a VillageSQL install, on Linux or macOS
+- VillageSQL 0.0.8 (a server build or an install), on Linux or macOS
 - CMake 3.18 or newer
 - A C++17 compiler (GCC or Clang)
+
+### The development SDK is required
+
+The `hll` column type uses a feature (`variable_length_type()`) that is only
+in the extension SDK's development headers, so `CMakeLists.txt` turns them on
+with `set(VSQL_USE_DEV_ABI ON)`. Your VillageSQL build must include these
+headers (the `include-dev/` folder of the SDK).
+
+### Building
 
 From the root of this repository:
 
@@ -201,8 +211,16 @@ If there are no rows at all, both return NULL. If every row is NULL,
 
 ### How accurate is it?
 
-Each sketch is about 12 KB. With that size the estimate is, on average, off
-by less than 1%. Small counts (a few dozen values) are usually exact.
+Each sketch is about 12 KB. With that size the estimate is usually within
+about 1% of the real count, and small counts (a few dozen values) are usually
+exact.
+
+There is one range where the error is larger. The extension uses one formula
+for smaller counts and another for larger counts, and switches between them
+at around 40,000 different values. In that range the estimate is typically
+2–3% too high, and a single sketch can be a little more than that (for
+example, 40,000 different values gave an estimate of 41,216). The error then
+shrinks again and is back under 1% by about 70,000 values.
 
 ## Saving and loading sketches
 
@@ -220,6 +238,90 @@ by less than 1%. Small counts (a few dozen values) are usually exact.
 Text that is not a valid sketch is refused with error 3219, and the message
 says what is wrong.
 
+## Known limitations
+
+### You cannot index an `hll` column
+
+An index, `PRIMARY KEY`, or `UNIQUE` key on an `hll` column is refused:
+
+```
+ERROR 1071 (42000): Specified key was too long; max key length is 3072 bytes
+```
+
+MySQL allows at most 3,072 bytes in an index key, and a sketch with values
+in it takes 12,291 bytes.
+
+### The aggregates cannot be used as window functions
+
+`hll_agg(...) OVER (...)` and `hll_union_agg(...) OVER (...)` give a syntax
+error, because the server does not accept `OVER` after an extension's
+aggregate function. Use `GROUP BY` instead, or save one sketch per group and
+combine them with `hll_union_agg`.
+
+`hll_agg(DISTINCT ...)` is also a syntax error. You do not need it: a sketch
+already counts each value only once.
+
+### The sketch size is fixed
+
+Every sketch uses the same settings (log2m 14 and regwidth 6): about 12 KB.
+You cannot choose a smaller sketch with a larger error, or a bigger one with
+a smaller error. The fixed size is what lets any two sketches be combined.
+
+### Estimates are less accurate around 40,000 values
+
+See [How accurate is it?](#how-accurate-is-it).
+
+### Aggregate results inside a subquery in `FROM` or `WITH`
+
+When the result of `hll_agg` or `hll_union_agg` comes out of a subquery in
+`FROM` or a `WITH` query, other `hll` functions cannot use it:
+
+```sql
+-- Fails: argument 1 must be a custom type or string constant
+SELECT hll_cardinality(a)
+FROM (SELECT hll_agg(hll_hash_bigint(user_id)) AS a FROM page_views) t;
+```
+
+Call the function around the aggregate directly instead, or save the sketch
+in a table first:
+
+```sql
+SELECT hll_cardinality(hll_agg(hll_hash_bigint(user_id))) FROM page_views;
+```
+
+Sketches read from a table column work fine in subqueries.
+
+### Most built-in MySQL functions do not accept `hll` values
+
+Functions such as `LENGTH`, `HEX`, `CONCAT`, `COALESCE`, `IF`, and
+`JSON_OBJECT` refuse an `hll` value with an error like
+`Incorrect usage of length and hll`. `CAST` to or from `hll` does not work
+either. Use the `hll_*` functions, and use a plain `SELECT` of the column when
+you need the sketch as text.
+
+### Sorting by a sketch has no meaning
+
+`=` and `<>` tell you whether two sketches are the same. `ORDER BY`, `<`, and
+`>` also work on `hll` columns, but they compare the stored bytes, so the
+order tells you nothing about the counts. Sort by `hll_cardinality(...)`
+instead.
+
+### `hll_add` and `hll_agg` do not check that the value is a hash
+
+Both accept any whole number. If you pass the original value instead of its
+hash, for example `hll_add(sketch, user_id)`, there is no error, but the
+count is wrong: `hll_cardinality(hll_add(hll_empty(), 5))` returns 0. Always
+wrap values in an `hll_hash_*` function. Text passed where a number is
+expected is turned into a number: text like `'5'` with no warning at all, and
+text that is not a number (like `'abc'`) with only a warning.
+
+### Other limits
+
+| Limitation | What to do instead |
+|---|---|
+| No function takes binary data directly. | Convert it to hex text first: `hll_hash_bytea_hex(HEX(column))`. |
+| There is no hash function for every column type. | Use `hll_hash_bigint` for whole numbers and `hll_hash_text` for everything else. Note that `hll_hash_bigint` rounds decimals (`hll_hash_bigint(1.9)` is the same as `hll_hash_bigint(2)`). |
+| If `hll_union_agg` is given an invalid sketch, the error is reported for the whole group, not for the bad row. | Run `hll_cardinality(sketch)` on each row to find the one that fails. |
 
 ## Common problems
 
