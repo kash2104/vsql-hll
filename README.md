@@ -3,8 +3,7 @@
 `vsql_hll` is a VillageSQL extension that counts how many **different** values
 a column holds (for example, how many different users visited your site)
 quickly and with very little storage. The answer is an estimate, but a close
-one: usually within about 1% of the real count. Just above 40,000 different
-values it can be up to about 3% too high (see
+one: usually within about 1% of the real count (see
 [How accurate is it?](#how-accurate-is-it)).
 
 ```sql
@@ -218,10 +217,10 @@ exact.
 
 There is one range where the error is larger. The extension uses one formula
 for smaller counts and another for larger counts, and switches between them
-at around 40,000 different values. Just above the switch the estimate comes
-out too high, by up to about 3% (for example, 40,000 different values gave an
-estimate of 41,216). The error then shrinks again and is back under 1% by
-about 70,000 values.
+at around 40,000 different values. In that range the estimate is typically
+2–3% too high, and a single sketch can be a little more than that (for
+example, 40,000 different values gave an estimate of 41,216). The error then
+shrinks again and is back under 1% by about 70,000 values.
 
 ## Saving and loading sketches
 
@@ -264,12 +263,13 @@ already counts each value only once.
 
 ### The sketch size is fixed
 
-Every sketch uses the same settings (log2m 14 and regwidth 6): about 12 KB. You cannot choose a smaller sketch with a larger error, or a bigger one with a smaller error. The fixed size is what lets any two sketches be combined.
+Every sketch uses the same settings (log2m 14 and regwidth 6): about 12 KB.
+You cannot choose a smaller sketch with a larger error, or a bigger one with
+a smaller error. The fixed size is what lets any two sketches be combined.
 
-### Estimates run high just above 40,000 values
+### Estimates are less accurate around 40,000 values
 
-In this range the estimate can be up to about 3% too high, instead of the
-usual 1%. See [How accurate is it?](#how-accurate-is-it).
+See [How accurate is it?](#how-accurate-is-it).
 
 ### Aggregate results inside a subquery in `FROM` or `WITH`
 
@@ -312,8 +312,8 @@ Both accept any whole number. If you pass the original value instead of its
 hash, for example `hll_add(sketch, user_id)`, there is no error, but the
 count is wrong: `hll_cardinality(hll_add(hll_empty(), 5))` returns 0. Always
 wrap values in an `hll_hash_*` function. Text passed where a number is
-expected is turned into a number with only a warning, so check for warnings
-too.
+expected is turned into a number: text like `'5'` with no warning at all, and
+text that is not a number (like `'abc'`) with only a warning.
 
 ### Other limits
 
@@ -322,7 +322,6 @@ too.
 | No function takes binary data directly. | Convert it to hex text first: `hll_hash_bytea_hex(HEX(column))`. |
 | There is no hash function for every column type. | Use `hll_hash_bigint` for whole numbers and `hll_hash_text` for everything else. Note that `hll_hash_bigint` rounds decimals (`hll_hash_bigint(1.9)` is the same as `hll_hash_bigint(2)`). |
 | If `hll_union_agg` is given an invalid sketch, the error is reported for the whole group, not for the bad row. | Run `hll_cardinality(sketch)` on each row to find the one that fails. |
-
 
 ## Common problems
 
